@@ -1,5 +1,9 @@
 # Weekly Digest
 
+![Community Contribution](https://img.shields.io/badge/OB1_COMMUNITY-Approved_Contribution-2ea44f?style=for-the-badge&logo=github)
+
+**Created by [@alanshurafa](https://github.com/alanshurafa)**
+
 > Scheduled importance-ranked synthesis of the past week's thoughts, delivered to Telegram (or stdout, or a file).
 
 ## What It Does
@@ -68,7 +72,7 @@ export TELEGRAM_CHAT_ID="987654321"            # optional
 
 > `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` match the rest of the `recipes/` tree so you can share a single `.env.local` across recipes. `OPEN_BRAIN_URL` and `OPEN_BRAIN_SERVICE_KEY` are accepted as legacy aliases for back-compat but emit a one-time deprecation warning.
 
-3. Smoke test it with `--dry-run` first so nothing ships anywhere:
+1. Smoke test it with `--dry-run` first so nothing ships anywhere:
 
 ```bash
 node weekly-digest.mjs --dry-run --output=stdout --window=7
