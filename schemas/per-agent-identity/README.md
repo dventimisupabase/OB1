@@ -1,5 +1,15 @@
 # Per-Agent Identity
 
+<div align="center">
+
+![Community Contribution](https://img.shields.io/badge/OB1_COMMUNITY-Approved_Contribution-2ea44f?style=for-the-badge&logo=github)
+
+**Created by [@jeremylahners](https://github.com/jeremylahners)**
+
+*Reviewed and merged by the Open Brain maintainer team — thank you for building the future of AI memory!*
+
+</div>
+
 > Adds an optional server-side identity primitive for multi-agent Open Brain deployments.
 
 ## What It Does
