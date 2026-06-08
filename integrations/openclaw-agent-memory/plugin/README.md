@@ -6,9 +6,24 @@ Built by Nate B. Jones / OB1. Follow Nate for practical AI systems, agent workfl
 
 ## Install
 
+Recommended for OpenClaw `2026.5.7` and newer:
+
 ```bash
 openclaw plugins install clawhub:@natebjones/ob1-agent-memory
 ```
+
+OpenClaw `2026.5.2` predates the current ClawHub npm-pack resolver metadata
+path. Use the published tarball fallback on that host version:
+
+```bash
+curl -fsSL \
+  https://clawhub.ai/api/npm/@natebjones/ob1-agent-memory/-/natebjones-ob1-agent-memory-0.1.6.tgz \
+  -o natebjones-ob1-agent-memory-0.1.6.tgz
+
+openclaw plugins install ./natebjones-ob1-agent-memory-0.1.6.tgz
+```
+
+The package is published on ClawHub as `@natebjones/ob1-agent-memory`.
 
 For local linked development:
 
@@ -62,7 +77,7 @@ openclaw --profile ob1-agent-memory plugins install . --link
 }
 ```
 
-Configure `secrets.providers.ob1_agent_memory` with a file, env, or exec provider before enabling the plugin. The plugin resolves OpenClaw SecretRefs at tool execution time so the access key does not need to live in plaintext config.
+Configure `secrets.providers.ob1_agent_memory` with a file or exec provider before enabling the plugin. The plugin resolves OpenClaw SecretRefs at tool execution time so the access key does not need to live in plaintext config. Env SecretRefs are intentionally not used in the launch package so OpenClaw's install-time safety scan does not classify the memory client as env-to-network credential forwarding.
 
 Current OpenClaw builds also require explicit `tools.allow` entries before plugin tools are exposed to the model. `plugins inspect --runtime` can show the plugin is registered even when the agent cannot see the tools, so run a native tool smoke test after enabling the plugin.
 
