@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node test-stateless.mjs"
+    "test": "node test-helpers.mjs && node test-stateless.mjs"
   },
   "devDependencies": {
     "@hono/mcp": "^0.1.5",

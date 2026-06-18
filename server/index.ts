@@ -30,6 +30,20 @@ type ThoughtRecord = {
   updated_at?: string | null;
 };
 
+// Row shape returned by match_thoughts_hybrid (and, minus the extra fields, the
+// match_thoughts fallback).
+type HybridMatch = {
+  id: string;
+  content: string;
+  metadata: Record<string, unknown>;
+  status?: string | null;
+  created_at: string;
+  similarity: number;
+  text_rank?: number;
+  score?: number;
+  total_count?: number;
+};
+
 const CITATION_BASE_URL =
   Deno.env.get("OPEN_BRAIN_CITATION_BASE_URL") || "https://openbrain.local/thoughts";
 
@@ -41,6 +55,33 @@ function thoughtTitle(content: string, createdAt?: string): string {
 
 function thoughtUrl(id: string): string {
   return `${CITATION_BASE_URL.replace(/\/$/, "")}/${id}`;
+}
+
+// Open-loop status vocabulary (see schemas/open-loops).
+const OPEN_LOOP_STATUSES = ["open", "waiting", "closed"] as const;
+type OpenLoopStatus = (typeof OPEN_LOOP_STATUSES)[number];
+
+// Clamp a requested page size into [1, max]; fall back to def when unset.
+function clampLimit(n: number | undefined, def: number, max: number): number {
+  const v = typeof n === "number" && Number.isFinite(n) ? Math.floor(n) : def;
+  return Math.max(1, Math.min(v, max));
+}
+
+// Non-negative offset.
+function safeOffset(n: number | undefined): number {
+  const v = typeof n === "number" && Number.isFinite(n) ? Math.floor(n) : 0;
+  return Math.max(0, v);
+}
+
+// "Showing X–Y of N" footer for paginated tool output. Returns "" when there
+// is nothing more to page through.
+function pageFooter(offset: number, returned: number, total: number | null): string {
+  if (total == null) return "";
+  const first = total === 0 ? 0 : offset + 1;
+  const last = offset + returned;
+  let footer = `\nShowing ${first}–${last} of ${total}.`;
+  if (last < total) footer += ` Pass offset=${last} for the next page.`;
+  return footer;
 }
 
 async function getEmbedding(text: string): Promise<number[]> {
@@ -76,13 +117,33 @@ async function extractMetadata(text: string): Promise<Record<string, unknown>> {
       messages: [
         {
           role: "system",
-          content: `Extract metadata from the user's captured thought. Return JSON with:
+          content: `You classify a captured thought for a personal "second brain". Return STRICT JSON.
+
+Keys for every thought:
+- "type": one of "observation" | "task" | "idea" | "reference" | "person_note".
+  Choose by INTENT, not keywords:
+    • task = something someone still needs to DO or follow up on (an open loop, a commitment, an owed action).
+    • observation = a fact, decision, resolution, or outcome — what happened or is true. A DECIDED or FINISHED thing is an observation, NOT a task, even if it contains action verbs ("decided to", "resolved", "shipped", "done").
+    • idea = a proposal or possibility not yet committed to.
+    • reference = durable reference info (links, specs, how-tos).
+    • person_note = a note primarily about a person.
 - "people": array of people mentioned (empty if none)
 - "action_items": array of implied to-dos (empty if none)
 - "dates_mentioned": array of dates YYYY-MM-DD (empty if none)
 - "topics": array of 1-3 short topic tags (always at least one)
-- "type": one of "observation", "task", "idea", "reference", "person_note"
-Only extract what's explicitly there.`,
+
+ONLY for "type":"task", also return:
+- "status": "open" | "waiting" | "closed".
+    • open = the author still owes the action / it is theirs to do next.
+    • waiting = blocked on someone else; the next move is another party's ("THEIR open loop", "waiting on X").
+    • closed = already done / resolved.
+- "owner": who owes the action — a name, or "me" when it is the author's own. Empty string if unclear.
+
+Only extract what is explicitly there. Examples:
+{"input":"David to run the Greptile fitness check next week.","output":{"type":"task","status":"open","owner":"David","topics":["greptile"],"people":["David"],"action_items":["run fitness check"],"dates_mentioned":[]}}
+{"input":"Eric to send the snapshot queries — THEIR open loop.","output":{"type":"task","status":"waiting","owner":"Eric","topics":["queries"],"people":["Eric"],"action_items":["send snapshot queries"],"dates_mentioned":[]}}
+{"input":"Decided to upgrade to Postgres 17 after testing in a shadow project.","output":{"type":"observation","topics":["postgres","upgrade"],"people":[],"action_items":[],"dates_mentioned":[]}}
+{"input":"CLOSED loop — posted the database fitness doc to the Slack channel.","output":{"type":"task","status":"closed","owner":"me","topics":["fitness-doc"],"people":[],"action_items":[],"dates_mentioned":[]}}`,
         },
         { role: "user", content: text },
       ],
@@ -219,60 +280,83 @@ function buildServer(): McpServer {
       },
       inputSchema: {
         query: z.string().describe("What to search for"),
-        limit: z.number().optional().default(10),
-        threshold: z.number().optional().default(0.5),
+        limit: z.number().optional().default(10).describe("Page size (default 10, max 200)"),
+        offset: z.number().optional().describe("Skip this many ranked results for pagination (default 0)"),
+        threshold: z.number().optional().default(0.5).describe("Min semantic similarity for the pure-semantic fallback"),
+        status: z.array(z.string()).optional().describe("Restrict to these open-loop statuses, e.g. [\"open\",\"waiting\"]"),
       },
     },
-    async ({ query, limit, threshold }) => {
+    async ({ query, limit, offset, threshold, status }) => {
       try {
+        const lim = clampLimit(limit, 10, 200);
+        const off = safeOffset(offset);
+        const statusFilter = status && status.length ? status : null;
         const qEmb = await getEmbedding(query);
-        const { data, error } = await supabase.rpc("match_thoughts", {
+
+        // Prefer hybrid (semantic + keyword) ranking; fall back to pure semantic
+        // if match_thoughts_hybrid isn't installed (schemas/open-loops not applied).
+        let rows: HybridMatch[] = [];
+        let total: number | null = null;
+        let hybrid = true;
+
+        const h = await supabase.rpc("match_thoughts_hybrid", {
           query_embedding: qEmb,
-          match_threshold: threshold,
-          match_count: limit,
-          filter: {},
+          p_query_text: query,
+          match_count: lim,
+          match_offset: off,
+          p_status: statusFilter,
+          semantic_weight: 0.6,
         });
 
-        if (error) {
-          return {
-            content: [{ type: "text" as const, text: `Search error: ${error.message}` }],
-            isError: true,
-          };
+        if (h.error) {
+          hybrid = false;
+          const s = await supabase.rpc("match_thoughts", {
+            query_embedding: qEmb,
+            match_threshold: threshold,
+            match_count: lim,
+            filter: {},
+          });
+          if (s.error) {
+            return {
+              content: [{ type: "text" as const, text: `Search error: ${s.error.message}` }],
+              isError: true,
+            };
+          }
+          rows = (s.data || []) as HybridMatch[];
+        } else {
+          rows = (h.data || []) as HybridMatch[];
+          total = rows.length ? Number(rows[0].total_count ?? rows.length) : 0;
         }
 
-        if (!data || data.length === 0) {
+        if (!rows.length) {
           return {
             content: [{ type: "text" as const, text: `No thoughts found matching "${query}".` }],
           };
         }
 
-        const results = data.map(
-          (
-            t: ThoughtMatch,
-            i: number
-          ) => {
-            const m = t.metadata || {};
-            const parts = [
-              `--- Result ${i + 1} (${(t.similarity * 100).toFixed(1)}% match) ---`,
-              `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
-              `Type: ${m.type || "unknown"}`,
-            ];
-            if (Array.isArray(m.topics) && m.topics.length)
-              parts.push(`Topics: ${(m.topics as string[]).join(", ")}`);
-            if (Array.isArray(m.people) && m.people.length)
-              parts.push(`People: ${(m.people as string[]).join(", ")}`);
-            if (Array.isArray(m.action_items) && m.action_items.length)
-              parts.push(`Actions: ${(m.action_items as string[]).join("; ")}`);
-            parts.push(`\n${t.content}`);
-            return parts.join("\n");
-          }
-        );
+        const results = rows.map((t: HybridMatch, i: number) => {
+          const m = t.metadata || {};
+          const pct = typeof t.score === "number" ? t.score : t.similarity;
+          const parts = [
+            `--- Result ${off + i + 1} (${(pct * 100).toFixed(1)}% ${hybrid ? "hybrid" : "match"}) ---`,
+            `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
+            `Type: ${m.type || "unknown"}${t.status ? ` {${t.status}}` : ""}`,
+          ];
+          if (Array.isArray(m.topics) && m.topics.length)
+            parts.push(`Topics: ${(m.topics as string[]).join(", ")}`);
+          if (Array.isArray(m.people) && m.people.length)
+            parts.push(`People: ${(m.people as string[]).join(", ")}`);
+          if (Array.isArray(m.action_items) && m.action_items.length)
+            parts.push(`Actions: ${(m.action_items as string[]).join("; ")}`);
+          parts.push(`\n${t.content}`);
+          return parts.join("\n");
+        });
 
         return {
           content: [
             {
               type: "text" as const,
-              text: `Found ${data.length} thought(s):\n\n${results.join("\n\n")}`,
+              text: `Found thought(s):\n\n${results.join("\n\n")}${pageFooter(off, rows.length, total)}`,
             },
           ],
         };
@@ -296,31 +380,37 @@ function buildServer(): McpServer {
         readOnlyHint: true,
       },
       inputSchema: {
-        limit: z.number().optional().default(10),
+        limit: z.number().optional().default(25).describe("Page size (default 25, max 200)"),
+        offset: z.number().optional().describe("Skip this many rows for pagination (default 0)"),
         type: z.string().optional().describe("Filter by type: observation, task, idea, reference, person_note"),
         topic: z.string().optional().describe("Filter by topic tag"),
         person: z.string().optional().describe("Filter by person mentioned"),
+        status: z.string().optional().describe("Filter by open-loop status: open, waiting, closed"),
         days: z.number().optional().describe("Only thoughts from the last N days"),
       },
     },
-    async ({ limit, type, topic, person, days }) => {
+    async ({ limit, offset, type, topic, person, status, days }) => {
       try {
+        const lim = clampLimit(limit, 25, 200);
+        const off = safeOffset(offset);
+
         let q = supabase
           .from("thoughts")
-          .select("content, metadata, created_at")
+          .select("content, metadata, created_at, status", { count: "exact" })
           .order("created_at", { ascending: false })
-          .limit(limit);
+          .range(off, off + lim - 1);
 
         if (type) q = q.contains("metadata", { type });
         if (topic) q = q.contains("metadata", { topics: [topic] });
         if (person) q = q.contains("metadata", { people: [person] });
+        if (status) q = q.eq("status", status);
         if (days) {
           const since = new Date();
           since.setDate(since.getDate() - days);
           q = q.gte("created_at", since.toISOString());
         }
 
-        const { data, error } = await q;
+        const { data, error, count } = await q;
 
         if (error) {
           return {
@@ -335,12 +425,13 @@ function buildServer(): McpServer {
 
         const results = data.map(
           (
-            t: { content: string; metadata: Record<string, unknown>; created_at: string },
+            t: { content: string; metadata: Record<string, unknown>; created_at: string; status?: string | null },
             i: number
           ) => {
             const m = t.metadata || {};
             const tags = Array.isArray(m.topics) ? (m.topics as string[]).join(", ") : "";
-            return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${t.content}`;
+            const st = t.status ? ` {${t.status}}` : "";
+            return `${off + i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""})${st}\n   ${t.content}`;
           }
         );
 
@@ -348,7 +439,7 @@ function buildServer(): McpServer {
           content: [
             {
               type: "text" as const,
-              text: `${data.length} recent thought(s):\n\n${results.join("\n\n")}`,
+              text: `Recent thought(s):\n\n${results.join("\n\n")}${pageFooter(off, data.length, count ?? null)}`,
             },
           ],
         };
@@ -425,6 +516,23 @@ function buildServer(): McpServer {
           for (const [k, v] of sort(people)) lines.push(`  ${k}: ${v}`);
         }
 
+        // Open-loop status breakdown (best-effort: the `status` column only
+        // exists once schemas/open-loops has been applied — a missing column
+        // returns an error we simply skip rather than failing the whole stat).
+        const statusRes = await supabase.from("thoughts").select("status");
+        if (!statusRes.error && statusRes.data) {
+          const statuses: Record<string, number> = {};
+          for (const r of statusRes.data as { status: string | null }[]) {
+            if (r.status) statuses[r.status] = (statuses[r.status] || 0) + 1;
+          }
+          if (Object.keys(statuses).length) {
+            lines.push("", "Open loops:");
+            for (const k of ["open", "waiting", "closed"]) {
+              if (statuses[k]) lines.push(`  ${k}: ${statuses[k]}`);
+            }
+          }
+        }
+
         return { content: [{ type: "text" as const, text: lines.join("\n") }] };
       } catch (err: unknown) {
         return {
@@ -435,7 +543,139 @@ function buildServer(): McpServer {
     }
   );
 
-  // Tool 4: Capture Thought
+  // Tool 4: List Open Loops
+  server.registerTool(
+    "list_open_loops",
+    {
+      title: "List Open Loops",
+      description:
+        "Enumerate your open loops — tasks/commitments — by status, with pagination. This is the way to get the COMPLETE outstanding-commitment list; unlike a recency list it is not capped at 10. Status is any of: open (you owe it), waiting (blocked on someone else), closed (done). Optionally filter by owner (e.g. 'David').",
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        status: z
+          .array(z.enum(OPEN_LOOP_STATUSES))
+          .optional()
+          .describe("Statuses to include (default: open + waiting)"),
+        owner: z.string().optional().describe("Only loops owned by this person (e.g. 'David')"),
+        limit: z.number().optional().default(50).describe("Page size (default 50, max 200)"),
+        offset: z.number().optional().describe("Skip this many rows for pagination (default 0)"),
+      },
+    },
+    async ({ status, owner, limit, offset }) => {
+      try {
+        const statuses = status && status.length ? status : ["open", "waiting"];
+        const lim = clampLimit(limit, 50, 200);
+        const off = safeOffset(offset);
+
+        const { data, error } = await supabase.rpc("list_open_loops", {
+          p_status: statuses,
+          p_owner: owner ?? null,
+          p_limit: lim,
+          p_offset: off,
+        });
+
+        if (error) {
+          return {
+            content: [{ type: "text" as const, text: `Error: ${error.message}` }],
+            isError: true,
+          };
+        }
+
+        const rows = (data || []) as Array<{
+          id: string;
+          content: string;
+          metadata: Record<string, unknown>;
+          status: string;
+          owner: string | null;
+          created_at: string;
+          total_count: number;
+        }>;
+
+        if (!rows.length) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `No open loops found for status ${statuses.join("/")}${owner ? ` owned by ${owner}` : ""}.`,
+              },
+            ],
+          };
+        }
+
+        const total = Number(rows[0].total_count ?? rows.length);
+        const icon: Record<string, string> = { open: "🔴", waiting: "🟡", closed: "✅" };
+        const lines = rows.map((t, i) => {
+          const o = t.owner ? ` — ${t.owner}` : "";
+          return `${off + i + 1}. ${icon[t.status] || ""} [${t.status}${o}] (${new Date(t.created_at).toLocaleDateString()})\n   id: ${t.id}\n   ${t.content}`;
+        });
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Open loops (${statuses.join(", ")}${owner ? `, owner=${owner}` : ""}):\n\n${lines.join("\n\n")}${pageFooter(off, rows.length, total)}`,
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Tool 5: Set Thought Status
+  server.registerTool(
+    "set_thought_status",
+    {
+      title: "Set Thought Status",
+      description:
+        "Set the open-loop status of a thought (open, waiting, or closed) so resolved loops stop resurfacing. Pass the thought id shown by list_open_loops or fetch.",
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      inputSchema: {
+        id: z.string().describe("The thought ID (UUID)"),
+        status: z.enum(OPEN_LOOP_STATUSES).describe("New status: open, waiting, or closed"),
+      },
+    },
+    async ({ id, status }) => {
+      try {
+        const { data, error } = await supabase.rpc("set_thought_status", {
+          p_id: id,
+          p_status: status,
+        });
+
+        if (error) {
+          return {
+            content: [{ type: "text" as const, text: `Error: ${error.message}` }],
+            isError: true,
+          };
+        }
+
+        const res = (data || {}) as { updated?: boolean; status?: string };
+        if (!res.updated) {
+          return { content: [{ type: "text" as const, text: `No thought found with id ${id}.` }] };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `Updated ${id} → ${res.status}.` }],
+        };
+      } catch (err: unknown) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Tool 6: Capture Thought
   server.registerTool(
     "capture_thought",
     {
@@ -485,9 +725,30 @@ function buildServer(): McpServer {
         }
 
         const meta = metadata as Record<string, unknown>;
+
+        // For task-type thoughts, give them an open-loop status. The value also
+        // rides along in metadata (above); writing the dedicated `status` column
+        // is best-effort — it only exists once schemas/open-loops (or
+        // workflow-status / enhanced-thoughts) has been applied, so a missing
+        // column must not fail the capture.
+        let status: OpenLoopStatus | null = null;
+        if (meta.type === "task") {
+          const raw = typeof meta.status === "string" ? meta.status.toLowerCase() : "";
+          status = (OPEN_LOOP_STATUSES as readonly string[]).includes(raw)
+            ? (raw as OpenLoopStatus)
+            : "open";
+          await supabase
+            .from("thoughts")
+            .update({ status, status_updated_at: new Date().toISOString() })
+            .eq("id", thoughtId);
+        }
+
         let confirmation = `Captured as ${meta.type || "thought"}`;
+        if (status) confirmation += ` [${status}]`;
         if (Array.isArray(meta.topics) && meta.topics.length)
           confirmation += ` — ${(meta.topics as string[]).join(", ")}`;
+        if (typeof meta.owner === "string" && meta.owner)
+          confirmation += ` | Owner: ${meta.owner}`;
         if (Array.isArray(meta.people) && meta.people.length)
           confirmation += ` | People: ${(meta.people as string[]).join(", ")}`;
         if (Array.isArray(meta.action_items) && meta.action_items.length)
