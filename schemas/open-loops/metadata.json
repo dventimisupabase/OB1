@@ -1,0 +1,20 @@
+{
+  "name": "Open Loops: status, exhaustive listing, and hybrid recall",
+  "description": "Adds an open/waiting/closed lifecycle to thoughts plus RPCs to enumerate open loops with pagination (list_open_loops), search with combined semantic + keyword ranking (match_thoughts_hybrid), and transition a loop's status (set_thought_status). Includes a heuristic backfill that classifies existing task thoughts.",
+  "category": "schemas",
+  "author": {
+    "name": "David A. Ventimiglia",
+    "github": "dventimisupabase"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": [],
+    "tools": []
+  },
+  "tags": ["schema", "status", "open-loops", "search", "hybrid-search", "pagination", "tasks"],
+  "difficulty": "intermediate",
+  "estimated_time": "15 minutes",
+  "created": "2026-06-18",
+  "updated": "2026-06-18"
+}
