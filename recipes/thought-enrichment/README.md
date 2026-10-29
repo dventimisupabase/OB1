@@ -1,5 +1,9 @@
 # Thought Enrichment Pipeline
 
+![Community Contribution](https://img.shields.io/badge/OB1_COMMUNITY-Approved_Contribution-2ea44f?style=for-the-badge&logo=github)
+
+**Created by [@alanshurafa](https://github.com/alanshurafa)**
+
 Retroactively classify and enrich your existing thoughts with structured metadata. The pipeline uses an LLM (via OpenRouter or Anthropic API) to extract type, summary, topics, tags, people, action items, confidence, and importance for each thought. A separate regex-based scanner detects sensitive content (SSNs, credit cards, API keys, health data) and assigns sensitivity tiers.
 
 ## Prerequisites
@@ -15,7 +19,7 @@ Retroactively classify and enrich your existing thoughts with structured metadat
 
    ```
    SUPABASE_URL=https://your-project-ref.supabase.co
-   SUPABASE_SERVICE_ROLE_KEY=eyJ...
+   SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
    OPENROUTER_API_KEY=sk-or-v1-...
    ```
 
@@ -51,7 +55,11 @@ Classifies each thought using an LLM and writes structured metadata back to Supa
    node enrich-thoughts.mjs --apply --retry-failed
    ```
 
-**Flags:** `--provider` (openrouter or anthropic), `--concurrency`, `--limit`, `--skip`, `--model`.
+**Flags:** `--provider` (openrouter or anthropic), `--concurrency`, `--limit`, `--skip`, `--model`, `--max-calls`, `--reset-state`.
+
+The `--max-calls` flag is a hard ceiling on the number of LLM calls per run. The default is `10000`; pass `--max-calls 0` to disable the cap. When the limit is hit the script aborts cleanly, prints a summary, and leaves remaining rows with `enriched=false` so you can resume later. This protects against a shell typo (e.g. dropping `--limit`) burning unbounded spend against a large un-enriched table.
+
+**Resume.** The script checkpoints `lastProcessedId` to `data/enrichment-state.json` after each concurrency chunk. On startup, if a checkpoint exists and neither `--skip` nor `--reset-state` was passed, the run resumes from `id > lastProcessedId`. The `enriched=false` filter is still applied as a second layer of defense. Pass `--reset-state` to ignore the checkpoint and start from scratch.
 
 ### backfill-type.mjs -- Type canonicalization
 
@@ -81,9 +89,9 @@ Scans thought content for patterns matching SSNs, credit cards, API keys, passwo
 
 2. Apply:
 
-    ```bash
-    node backfill-sensitivity.mjs --apply
-    ```
+   ```bash
+   node backfill-sensitivity.mjs --apply
+   ```
 
 ## Recommended execution order
 
@@ -91,6 +99,25 @@ Scans thought content for patterns matching SSNs, credit cards, API keys, passwo
 2. Run `backfill-sensitivity.mjs` to tag sensitive content before enrichment.
 3. Run `enrich-thoughts.mjs --dry-run --limit 20` to preview LLM classifications.
 4. Run `enrich-thoughts.mjs --apply` to enrich all remaining thoughts.
+
+## Security notes
+
+- **Prompt injection:** thought content is wrapped in `<thought_content>` tags and the system prompt instructs the model to treat everything inside as untrusted data. Any literal tag occurrences in content are escaped. Output fields (`summary`, `topics`, `tags`, `people`, `action_items`) are length-capped and control-char-stripped before they are written to `metadata`. Even so, enriching hostile third-party imports (shared chat exports, scraped feeds) can still influence classification labels — review before trusting them as ground truth.
+- **Bearer token on the wire:** every request carries your Supabase service-role key. Double-check that `SUPABASE_URL` points at your own Supabase project, not a proxy or debug server.
+
+## Repairing double-encoded metadata (versions before this fix)
+
+Earlier versions of `enrich-thoughts.mjs` pre-stringified `metadata` before the request body was itself stringified, so PostgREST stored the `metadata` jsonb column as a JSON *string* instead of an object on every enriched row. Symptoms: `metadata->'topics'` returns NULL everywhere, `metadata @>` filters stop matching, and stats/dashboard topic lists go empty, while the raw value looks like `"{\"type\":...}"`.
+
+The inner string is the complete, valid metadata — nothing is lost. Repair in one transactional statement (SQL Editor):
+
+```sql
+UPDATE thoughts
+SET metadata = (metadata #>> '{}')::jsonb
+WHERE jsonb_typeof(metadata) = 'string';
+```
+
+If any row held a non-JSON string the statement aborts as a whole and changes nothing.
 
 ## Cost expectations
 
